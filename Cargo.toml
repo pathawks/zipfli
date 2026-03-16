@@ -1,0 +1,15 @@
+[package]
+name = "zipfli"
+version = "0.1.0"
+edition = "2024"
+description = "Create optimized ZIP archives using Zopfli compression"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pathawks/zipfli"
+authors = ["Pat Hawks <pat@pathawks.com>"]
+keywords = ["zip", "zopfli", "compression", "epub", "odf"]
+categories = ["command-line-utilities", "compression"]
+
+[dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
+crc32fast = "1.5.0"
+zopfli = "0.8.3"
