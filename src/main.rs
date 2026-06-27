@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
+mod input;
 mod progress;
 mod zip;
 
@@ -62,6 +63,11 @@ struct Cli {
     )]
     iterations_without_improvement: std::num::NonZeroU64,
 
+    /// Do not store entries for directories themselves (their contents are
+    /// still included; this also drops empty directories)
+    #[arg(long = "no-dir-entries", action = clap::ArgAction::SetFalse)]
+    dir_entries: bool,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
@@ -83,32 +89,72 @@ fn main() -> std::io::Result<()> {
 
     let mimetype_first = args.format.as_ref().is_some_and(|f| f.mimetype_first());
 
-    let mut inputs = args.inputs;
+    let mut entries = match input::expand(&args.inputs, args.dir_entries) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     if mimetype_first {
-        inputs.sort_by_key(|p| p.file_name().unwrap().to_string_lossy() != "mimetype");
+        entries.sort_by_key(|entry| entry.name() != "mimetype");
+    }
+
+    if entries.len() > u16::MAX as usize {
+        eprintln!(
+            "error: archive has {} entries, more than the {} a standard ZIP supports (ZIP64 is not supported)",
+            entries.len(),
+            u16::MAX
+        );
+        std::process::exit(1);
     }
 
     let dt = DosDateTime::zero();
-    let total_files = inputs.len();
+    let total_files = entries.iter().filter(|entry| entry.is_file()).count();
     let mut reporter = progress::ProgressReporter::new(args.quiet);
 
     let mut zip_data = vec![];
     let mut central_dir = Vec::new();
+    let mut file_index = 0usize;
 
-    for (index, input) in inputs.iter().enumerate() {
-        let filename = input.file_name().unwrap().to_string_lossy().to_string();
+    for entry in &entries {
+        if zip_data.len() > u32::MAX as usize {
+            eprintln!("error: archive exceeds 4 GiB; ZIP64 is not supported");
+            std::process::exit(1);
+        }
+        let local_header_offset = zip_data.len() as u32;
 
-        let file_data = match fs::read(input) {
+        let (filename, path) = match entry {
+            input::Entry::Directory { name } => {
+                zip_data.extend_from_slice(&zip::LocalFileHeader::directory(name).to_bytes());
+                central_dir.extend_from_slice(
+                    &zip::CentralDirectoryHeader::directory(name, local_header_offset).to_bytes(),
+                );
+                continue;
+            }
+            input::Entry::File { name, path } => (name, path),
+        };
+
+        let file_data = match fs::read(path) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("Failed to read file {:?}: {}", input, e);
+                eprintln!("Failed to read file {:?}: {}", path, e);
                 std::process::exit(1);
             }
         };
 
-        let mut is_store_only = store_only_files.iter().any(|f| filename == *f);
+        if file_data.len() > u32::MAX as usize {
+            eprintln!(
+                "error: {} is larger than 4 GiB; ZIP64 is not supported",
+                path.display()
+            );
+            std::process::exit(1);
+        }
 
-        reporter.start_file(&filename, index, total_files);
+        let mut is_store_only = store_only_files.contains(&filename.as_str());
+
+        reporter.start_file(filename, file_index, total_files);
         let start = Instant::now();
 
         let mut compressed = if is_store_only {
@@ -121,7 +167,7 @@ fn main() -> std::io::Result<()> {
                 file_data.as_slice(),
                 &mut compressed,
             ) {
-                eprintln!("Compression failed for file {:?}: {}", input, e);
+                eprintln!("Compression failed for file {:?}: {}", path, e);
                 std::process::exit(1);
             }
             compressed
@@ -145,10 +191,9 @@ fn main() -> std::io::Result<()> {
         let crc32 = crc32fast::hash(&file_data);
         let compressed_size = compressed.len() as u32;
         let uncompressed_size = file_data.len() as u32;
-        let local_header_offset = zip_data.len() as u32;
 
         let local_header = zip::LocalFileHeader::new(
-            &filename,
+            filename,
             compressed_size,
             uncompressed_size,
             crc32,
@@ -159,7 +204,7 @@ fn main() -> std::io::Result<()> {
         zip_data.extend_from_slice(&compressed);
 
         let central_header = zip::CentralDirectoryHeader::new(
-            &filename,
+            filename,
             compressed_size,
             uncompressed_size,
             crc32,
@@ -168,13 +213,19 @@ fn main() -> std::io::Result<()> {
             local_header_offset,
         );
         central_dir.extend_from_slice(&central_header.to_bytes());
+
+        file_index += 1;
     }
 
+    if zip_data.len() > u32::MAX as usize {
+        eprintln!("error: archive exceeds 4 GiB; ZIP64 is not supported");
+        std::process::exit(1);
+    }
     let offset = zip_data.len() as u32;
     zip_data.extend_from_slice(&central_dir);
 
     let eocd =
-        zip::EndOfCentralDirectory::new(inputs.len() as u16, offset, central_dir.len() as u32);
+        zip::EndOfCentralDirectory::new(entries.len() as u16, offset, central_dir.len() as u32);
     zip_data.extend_from_slice(&eocd.to_bytes());
 
     reporter.finish();

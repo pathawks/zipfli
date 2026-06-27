@@ -30,11 +30,25 @@ Write to stdout:
 zipfli - file1.txt file2.txt > output.zip
 ```
 
+Add a directory to recurse into it:
+
+```sh
+zipfli archive.zip src README.md
+```
+
 Use a format preset:
 
 ```sh
 zipfli --format epub book.epub mimetype META-INF/container.xml content.opf chapter1.xhtml
 ```
+
+### Directories
+
+When an input is a directory, zipfli adds its contents recursively. Entry names keep their path relative to how you named the directory on the command line, so `zipfli archive.zip src` stores `src/main.rs`, `src/zip.rs`, and so on. The same path preservation applies to files given with a path: `META-INF/container.xml` is stored at `META-INF/container.xml`, not flattened to `container.xml`.
+
+Like `zip`, zipfli writes an entry for each directory by default, which preserves empty directories; symlinks are skipped (with a warning). Pass `--no-dir-entries` to store only regular files and omit the directory markers.
+
+zipfli writes standard (non-ZIP64) archives, so it supports up to 65,535 entries and a total size of 4 GiB. Beyond those limits it exits with an error rather than produce a malformed archive.
 
 ### Format Presets
 
@@ -54,6 +68,7 @@ If a compressed file ends up larger than the original, it is automatically store
 |--------|-------------|
 | `-f`, `--format <FORMAT>` | Archive format preset (`epub`, `odf`, `ooxml`) |
 | `-i`, `--iterations-without-improvement <N>` | Zopfli iterations without improvement (default: 15) |
+| `--no-dir-entries` | Omit directory entries; store only regular files (also drops empty directories) |
 | `-q`, `--quiet` | Suppress progress output |
 | `-h`, `--help` | Print help |
 | `-V`, `--version` | Print version |

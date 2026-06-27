@@ -190,11 +190,7 @@ impl ProgressReporter {
             } else {
                 let orig = format_size(result.original_size);
                 let comp = format_size(result.compressed_size);
-                let pct = if result.original_size > 0 {
-                    100 - (result.compressed_size * 100 / result.original_size)
-                } else {
-                    0
-                };
+                let pct = savings_pct(result.original_size, result.compressed_size);
                 let secs = result.elapsed.as_secs_f64();
                 let _ = writeln!(
                     stderr,
