@@ -6,6 +6,20 @@ pub enum CompressionMethod {
     Deflate = 8,
 }
 
+/// External file attributes for a directory entry: the MS-DOS directory bit
+/// (`0x10`) plus a Unix `drwxr-xr-x` mode in the high word.
+const DIR_EXTERNAL_ATTRS: u32 = (0o040755 << 16) | 0x10;
+
+/// General-purpose bit-flag value for a file name. Sets bit 11 to signal a
+/// UTF-8 encoded name when it contains non-ASCII bytes, otherwise zero.
+fn gp_flag(name: &str) -> u16 {
+    if name.is_ascii() {
+        0
+    } else {
+        0x0800
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalFileHeader {
     pub version_to_extract: u16,
@@ -52,12 +66,24 @@ impl LocalFileHeader {
 
         Self {
             file_name: filename.to_string(),
+            general_purpose_flag: gp_flag(filename),
             uncompressed_size,
             compressed_size,
             compression_method,
             last_mod_time: dt.time,
             last_mod_date: dt.date,
             crc32,
+            ..Default::default()
+        }
+    }
+
+    /// Build a header for a directory entry. Its name ends in `/`, it is
+    /// stored uncompressed, and all sizes and the CRC are zero.
+    pub fn directory(name: &str) -> Self {
+        Self {
+            file_name: name.to_string(),
+            general_purpose_flag: gp_flag(name),
+            compression_method: CompressionMethod::Store as u16,
             ..Default::default()
         }
     }
@@ -98,6 +124,26 @@ pub struct CentralDirectoryHeader {
     pub uncompressed_size: u32,
     pub file_name: String,
     pub local_header_offset: u32,
+    pub external_attributes: u32,
+}
+
+impl Default for CentralDirectoryHeader {
+    fn default() -> Self {
+        Self {
+            version_made_by: 20,
+            version_to_extract: 20,
+            general_purpose_flag: 0,
+            compression_method: CompressionMethod::Deflate as u16,
+            last_mod_time: 0,
+            last_mod_date: 0,
+            crc32: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            file_name: String::new(),
+            local_header_offset: 0,
+            external_attributes: 0,
+        }
+    }
 }
 
 impl CentralDirectoryHeader {
@@ -123,11 +169,23 @@ impl CentralDirectoryHeader {
             compression_method,
             last_mod_time: dt.time,
             last_mod_date: dt.date,
-            version_made_by: 20,
-            version_to_extract: 20,
-            general_purpose_flag: 0,
+            general_purpose_flag: gp_flag(filename),
             crc32,
             local_header_offset,
+            ..Default::default()
+        }
+    }
+
+    /// Build a central-directory header for a directory entry: stored, zero
+    /// sizes, and external attributes marking it as a directory.
+    pub fn directory(name: &str, local_header_offset: u32) -> Self {
+        Self {
+            file_name: name.to_string(),
+            general_purpose_flag: gp_flag(name),
+            compression_method: CompressionMethod::Store as u16,
+            local_header_offset,
+            external_attributes: DIR_EXTERNAL_ATTRS,
+            ..Default::default()
         }
     }
 
@@ -153,7 +211,8 @@ impl CentralDirectoryHeader {
         buf.write_all(&0u16.to_le_bytes()).unwrap(); // file comment length
         buf.write_all(&0u16.to_le_bytes()).unwrap(); // disk number start
         buf.write_all(&0u16.to_le_bytes()).unwrap(); // internal file attributes
-        buf.write_all(&0u32.to_le_bytes()).unwrap(); // external file attributes
+        buf.write_all(&self.external_attributes.to_le_bytes())
+            .unwrap(); // external file attributes
         buf.write_all(&self.local_header_offset.to_le_bytes())
             .unwrap();
         buf.write_all(self.file_name.as_bytes()).unwrap();

@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
+mod input;
 mod progress;
 mod zip;
 
@@ -62,9 +63,36 @@ struct Cli {
     )]
     iterations_without_improvement: std::num::NonZeroU64,
 
+    /// Do not store entries for directories themselves (their contents are
+    /// still included; this also drops empty directories)
+    #[arg(long = "no-dir-entries", action = clap::ArgAction::SetFalse)]
+    dir_entries: bool,
+
+    /// Flatten paths: store every file under its base name, discarding
+    /// directory structure (like zip's -j; entry names must stay unique)
+    #[arg(
+        short = 'j',
+        long,
+        visible_alias = "junk-paths",
+        conflicts_with = "format"
+    )]
+    flatten: bool,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
+}
+
+/// Convert an archive length to the u32 field a standard ZIP requires,
+/// exiting with a clear error when the value would need ZIP64. The sentinel
+/// 0xFFFFFFFF itself is rejected too: readers reserve it for "see the ZIP64
+/// record", which we never write.
+fn require_u32(len: usize, what: &str) -> u32 {
+    if len >= u32::MAX as usize {
+        eprintln!("error: {what} exceeds the 4 GiB standard ZIP limit (ZIP64 is not supported)");
+        std::process::exit(1);
+    }
+    len as u32
 }
 
 fn main() -> std::io::Result<()> {
@@ -83,32 +111,67 @@ fn main() -> std::io::Result<()> {
 
     let mimetype_first = args.format.as_ref().is_some_and(|f| f.mimetype_first());
 
-    let mut inputs = args.inputs;
+    let expand_options = input::Options {
+        dir_entries: args.dir_entries,
+        flatten: args.flatten,
+    };
+    let mut entries = match input::expand(&args.inputs, expand_options) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     if mimetype_first {
-        inputs.sort_by_key(|p| p.file_name().unwrap().to_string_lossy() != "mimetype");
+        entries.sort_by_key(|entry| entry.name() != "mimetype");
+    }
+
+    // The 0xFFFF entry count is the ZIP64 sentinel, so stop one short of it.
+    if entries.len() >= u16::MAX as usize {
+        eprintln!(
+            "error: archive has {} entries; a standard ZIP holds at most {} (ZIP64 is not supported)",
+            entries.len(),
+            u16::MAX - 1
+        );
+        std::process::exit(1);
     }
 
     let dt = DosDateTime::zero();
-    let total_files = inputs.len();
+    let total_files = entries.iter().filter(|entry| entry.is_file()).count();
     let mut reporter = progress::ProgressReporter::new(args.quiet);
 
     let mut zip_data = vec![];
     let mut central_dir = Vec::new();
+    let mut file_index = 0usize;
 
-    for (index, input) in inputs.iter().enumerate() {
-        let filename = input.file_name().unwrap().to_string_lossy().to_string();
+    for entry in &entries {
+        let local_header_offset = require_u32(zip_data.len(), "archive");
 
-        let file_data = match fs::read(input) {
+        let (filename, path) = match entry {
+            input::Entry::Directory { name } => {
+                zip_data.extend_from_slice(&zip::LocalFileHeader::directory(name).to_bytes());
+                central_dir.extend_from_slice(
+                    &zip::CentralDirectoryHeader::directory(name, local_header_offset).to_bytes(),
+                );
+                continue;
+            }
+            input::Entry::File { name, path } => (name, path),
+        };
+
+        let file_data = match fs::read(path) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("Failed to read file {:?}: {}", input, e);
+                eprintln!("Failed to read file {:?}: {}", path, e);
                 std::process::exit(1);
             }
         };
 
-        let mut is_store_only = store_only_files.iter().any(|f| filename == *f);
+        let uncompressed_size = require_u32(file_data.len(), &path.display().to_string());
 
-        reporter.start_file(&filename, index, total_files);
+        let mut is_store_only = store_only_files.contains(&filename.as_str());
+
+        reporter.start_file(filename, file_index, total_files);
         let start = Instant::now();
 
         let mut compressed = if is_store_only {
@@ -121,7 +184,7 @@ fn main() -> std::io::Result<()> {
                 file_data.as_slice(),
                 &mut compressed,
             ) {
-                eprintln!("Compression failed for file {:?}: {}", input, e);
+                eprintln!("Compression failed for file {:?}: {}", path, e);
                 std::process::exit(1);
             }
             compressed
@@ -143,12 +206,11 @@ fn main() -> std::io::Result<()> {
         });
 
         let crc32 = crc32fast::hash(&file_data);
+        // The stored fallback caps compressed at file_data's guarded length.
         let compressed_size = compressed.len() as u32;
-        let uncompressed_size = file_data.len() as u32;
-        let local_header_offset = zip_data.len() as u32;
 
         let local_header = zip::LocalFileHeader::new(
-            &filename,
+            filename,
             compressed_size,
             uncompressed_size,
             crc32,
@@ -159,7 +221,7 @@ fn main() -> std::io::Result<()> {
         zip_data.extend_from_slice(&compressed);
 
         let central_header = zip::CentralDirectoryHeader::new(
-            &filename,
+            filename,
             compressed_size,
             uncompressed_size,
             crc32,
@@ -168,13 +230,18 @@ fn main() -> std::io::Result<()> {
             local_header_offset,
         );
         central_dir.extend_from_slice(&central_header.to_bytes());
+
+        file_index += 1;
     }
 
-    let offset = zip_data.len() as u32;
+    let offset = require_u32(zip_data.len(), "archive");
     zip_data.extend_from_slice(&central_dir);
 
-    let eocd =
-        zip::EndOfCentralDirectory::new(inputs.len() as u16, offset, central_dir.len() as u32);
+    let eocd = zip::EndOfCentralDirectory::new(
+        entries.len() as u16,
+        offset,
+        require_u32(central_dir.len(), "central directory"),
+    );
     zip_data.extend_from_slice(&eocd.to_bytes());
 
     reporter.finish();
