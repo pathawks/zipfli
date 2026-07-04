@@ -1,6 +1,24 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+
+/// How command-line inputs are expanded into archive entries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Emit an entry for each directory (preserves empty directories).
+    pub dir_entries: bool,
+    /// Store every file under its base name, discarding directory structure.
+    pub flatten: bool,
+}
+
+impl Options {
+    /// Directory markers are only meaningful when structure is kept.
+    fn include_dirs(self) -> bool {
+        self.dir_entries && !self.flatten
+    }
+}
 
 /// A single item to be written into the archive, in the order it should appear.
 #[derive(Debug)]
@@ -47,58 +65,80 @@ fn join_name(base: &str, name: &str) -> String {
     }
 }
 
-/// Expand the command-line inputs into a flat, ordered list of archive entries,
-/// walking directories recursively. When `include_dirs` is set, an explicit
-/// entry is emitted for each directory so that empty directories are preserved.
-pub fn expand(inputs: &[PathBuf], include_dirs: bool) -> io::Result<Vec<Entry>> {
+/// The final segment of an archive name, used when flattening.
+fn basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Attach the offending path to an I/O error so the user sees which input
+/// failed.
+fn path_err(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// Expand the command-line inputs into a flat, ordered, de-duplicated list of
+/// archive entries, walking directories recursively. Explicit inputs are
+/// followed even when they are symlinks; symlinks encountered *inside* a
+/// walked directory are skipped.
+pub fn expand(inputs: &[PathBuf], options: Options) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for input in inputs {
-        let metadata = fs::metadata(input)
-            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", input.display())))?;
+        let metadata = fs::metadata(input).map_err(|e| path_err(input, e))?;
         if metadata.is_dir() {
             let base = archive_name(input);
-            if include_dirs && !base.is_empty() {
+            if options.include_dirs() && !base.is_empty() {
                 entries.push(Entry::Directory {
                     name: format!("{base}/"),
                 });
             }
-            walk(input, &base, include_dirs, &mut entries)?;
+            walk(input, &base, options, &mut entries)?;
         } else {
+            let full = archive_name(input);
+            let name = if options.flatten {
+                basename(&full).to_string()
+            } else {
+                full
+            };
             entries.push(Entry::File {
                 path: input.clone(),
-                name: archive_name(input),
+                name,
             });
         }
     }
-    Ok(entries)
+    dedup(entries)
 }
 
 /// Recursively collect the contents of `dir`, naming entries relative to
 /// `base`. Children are visited in sorted order for deterministic output.
-fn walk(dir: &Path, base: &str, include_dirs: bool, entries: &mut Vec<Entry>) -> io::Result<()> {
+fn walk(dir: &Path, base: &str, options: Options, entries: &mut Vec<Entry>) -> io::Result<()> {
     let mut children = fs::read_dir(dir)
-        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?
+        .map_err(|e| path_err(dir, e))?
         .collect::<Result<Vec<_>, _>>()?;
     children.sort_by_key(|child| child.file_name());
 
     for child in children {
-        let name = join_name(base, &child.file_name().to_string_lossy());
+        let full = join_name(base, &child.file_name().to_string_lossy());
         let file_type = child.file_type()?;
         if file_type.is_dir() {
-            if include_dirs {
+            if options.include_dirs() {
                 entries.push(Entry::Directory {
-                    name: format!("{name}/"),
+                    name: format!("{full}/"),
                 });
             }
-            walk(&child.path(), &name, include_dirs, entries)?;
+            walk(&child.path(), &full, options, entries)?;
         } else if file_type.is_file() {
+            let name = if options.flatten {
+                basename(&full).to_string()
+            } else {
+                full
+            };
             entries.push(Entry::File {
                 path: child.path(),
                 name,
             });
         } else {
-            // Symlinks and other special files: skip rather than risk a read
-            // error or a traversal cycle.
+            // Symlinks and other special files inside a walked directory:
+            // skip rather than risk a read error or a traversal cycle.
             eprintln!(
                 "warning: skipping {} (not a regular file or directory)",
                 child.path().display()
@@ -106,6 +146,60 @@ fn walk(dir: &Path, base: &str, include_dirs: bool, entries: &mut Vec<Entry>) ->
         }
     }
     Ok(())
+}
+
+/// Whether two paths refer to the same file, resolving symlinks and
+/// relative-path spellings. Only consulted when two entries collide on the
+/// same archive name, so the extra stat cost is off the common path.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Drop entries that repeat an archive name already produced by the same
+/// source (the same directory or file listed twice); reject a name produced
+/// by two *different* files, since one would silently overwrite the other.
+fn dedup(entries: Vec<Entry>) -> io::Result<Vec<Entry>> {
+    let mut seen: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let source = match &entry {
+            Entry::File { path, .. } => Some(path.clone()),
+            Entry::Directory { .. } => None,
+        };
+        match seen.entry(entry.name().to_string()) {
+            MapEntry::Vacant(slot) => {
+                slot.insert(source);
+                result.push(entry);
+            }
+            MapEntry::Occupied(slot) => match (slot.get(), &source) {
+                // The same directory marker or the same file seen again.
+                (None, None) => {}
+                (Some(prev), Some(cur)) => {
+                    if !same_file(prev, cur) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "duplicate entry name {:?}: from both {} and {}",
+                                entry.name(),
+                                prev.display(),
+                                cur.display()
+                            ),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "duplicate entry name {:?}: two different inputs map to it",
+                            entry.name()
+                        ),
+                    ));
+                }
+            },
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -167,7 +261,7 @@ mod tests {
         let (_temp, root) = make_tree();
         let base = archive_name(&root);
 
-        let entries = expand(&[root], false).unwrap();
+        let entries = expand(&[root], Options::default()).unwrap();
 
         assert!(entries.iter().all(|e| e.is_file()));
         assert_eq!(
@@ -183,8 +277,12 @@ mod tests {
     fn expand_includes_directory_entries_when_requested() {
         let (_temp, root) = make_tree();
         let base = archive_name(&root);
+        let options = Options {
+            dir_entries: true,
+            ..Options::default()
+        };
 
-        let entries = expand(&[root], true).unwrap();
+        let entries = expand(&[root], options).unwrap();
 
         assert_eq!(
             names(&entries),
@@ -204,7 +302,7 @@ mod tests {
         let (_temp, root) = make_tree();
         let file = root.join("file1.txt");
 
-        let entries = expand(std::slice::from_ref(&file), false).unwrap();
+        let entries = expand(std::slice::from_ref(&file), Options::default()).unwrap();
 
         assert_eq!(names(&entries), vec![archive_name(&file)]);
         assert!(entries[0].is_file());
@@ -212,7 +310,52 @@ mod tests {
 
     #[test]
     fn expand_reports_a_missing_input() {
-        let err = expand(&[PathBuf::from("/no/such/path/zzz")], false).unwrap_err();
-        assert!(err.to_string().contains("/no/such/path/zzz"));
+        let missing = std::env::temp_dir().join("zipfli-test-definitely-missing");
+        let err = expand(std::slice::from_ref(&missing), Options::default()).unwrap_err();
+        assert!(err.to_string().contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn flatten_stores_basenames_and_no_directory_markers() {
+        let (_temp, root) = make_tree();
+        let options = Options {
+            flatten: true,
+            dir_entries: true, // must be ignored when flattening
+        };
+
+        let entries = expand(&[root], options).unwrap();
+
+        assert_eq!(names(&entries), vec!["file1.txt", "file2.txt"]);
+        assert!(entries.iter().all(|e| e.is_file()));
+    }
+
+    #[test]
+    fn flatten_rejects_colliding_names_from_different_files() {
+        let (_temp, root) = make_tree();
+        fs::write(root.join("sub").join("file1.txt"), b"impostor").unwrap();
+        let options = Options {
+            flatten: true,
+            ..Options::default()
+        };
+
+        let err = expand(&[root], options).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("file1.txt"));
+    }
+
+    #[test]
+    fn repeated_and_overlapping_inputs_are_deduplicated() {
+        let (_temp, root) = make_tree();
+        let file = root.join("file1.txt");
+        let options = Options {
+            dir_entries: true,
+            ..Options::default()
+        };
+
+        let twice = expand(&[root.clone(), file, root.clone()], options).unwrap();
+        let once = expand(&[root], options).unwrap();
+
+        assert_eq!(names(&twice), names(&once));
     }
 }

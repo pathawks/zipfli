@@ -68,9 +68,31 @@ struct Cli {
     #[arg(long = "no-dir-entries", action = clap::ArgAction::SetFalse)]
     dir_entries: bool,
 
+    /// Flatten paths: store every file under its base name, discarding
+    /// directory structure (like zip's -j; entry names must stay unique)
+    #[arg(
+        short = 'j',
+        long,
+        visible_alias = "junk-paths",
+        conflicts_with = "format"
+    )]
+    flatten: bool,
+
     /// Suppress progress output
     #[arg(short, long)]
     quiet: bool,
+}
+
+/// Convert an archive length to the u32 field a standard ZIP requires,
+/// exiting with a clear error when the value would need ZIP64. The sentinel
+/// 0xFFFFFFFF itself is rejected too: readers reserve it for "see the ZIP64
+/// record", which we never write.
+fn require_u32(len: usize, what: &str) -> u32 {
+    if len >= u32::MAX as usize {
+        eprintln!("error: {what} exceeds the 4 GiB standard ZIP limit (ZIP64 is not supported)");
+        std::process::exit(1);
+    }
+    len as u32
 }
 
 fn main() -> std::io::Result<()> {
@@ -89,7 +111,11 @@ fn main() -> std::io::Result<()> {
 
     let mimetype_first = args.format.as_ref().is_some_and(|f| f.mimetype_first());
 
-    let mut entries = match input::expand(&args.inputs, args.dir_entries) {
+    let expand_options = input::Options {
+        dir_entries: args.dir_entries,
+        flatten: args.flatten,
+    };
+    let mut entries = match input::expand(&args.inputs, expand_options) {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("error: {e}");
@@ -101,11 +127,12 @@ fn main() -> std::io::Result<()> {
         entries.sort_by_key(|entry| entry.name() != "mimetype");
     }
 
-    if entries.len() > u16::MAX as usize {
+    // The 0xFFFF entry count is the ZIP64 sentinel, so stop one short of it.
+    if entries.len() >= u16::MAX as usize {
         eprintln!(
-            "error: archive has {} entries, more than the {} a standard ZIP supports (ZIP64 is not supported)",
+            "error: archive has {} entries; a standard ZIP holds at most {} (ZIP64 is not supported)",
             entries.len(),
-            u16::MAX
+            u16::MAX - 1
         );
         std::process::exit(1);
     }
@@ -119,11 +146,7 @@ fn main() -> std::io::Result<()> {
     let mut file_index = 0usize;
 
     for entry in &entries {
-        if zip_data.len() > u32::MAX as usize {
-            eprintln!("error: archive exceeds 4 GiB; ZIP64 is not supported");
-            std::process::exit(1);
-        }
-        let local_header_offset = zip_data.len() as u32;
+        let local_header_offset = require_u32(zip_data.len(), "archive");
 
         let (filename, path) = match entry {
             input::Entry::Directory { name } => {
@@ -144,13 +167,7 @@ fn main() -> std::io::Result<()> {
             }
         };
 
-        if file_data.len() > u32::MAX as usize {
-            eprintln!(
-                "error: {} is larger than 4 GiB; ZIP64 is not supported",
-                path.display()
-            );
-            std::process::exit(1);
-        }
+        let uncompressed_size = require_u32(file_data.len(), &path.display().to_string());
 
         let mut is_store_only = store_only_files.contains(&filename.as_str());
 
@@ -189,8 +206,8 @@ fn main() -> std::io::Result<()> {
         });
 
         let crc32 = crc32fast::hash(&file_data);
+        // The stored fallback caps compressed at file_data's guarded length.
         let compressed_size = compressed.len() as u32;
-        let uncompressed_size = file_data.len() as u32;
 
         let local_header = zip::LocalFileHeader::new(
             filename,
@@ -217,15 +234,14 @@ fn main() -> std::io::Result<()> {
         file_index += 1;
     }
 
-    if zip_data.len() > u32::MAX as usize {
-        eprintln!("error: archive exceeds 4 GiB; ZIP64 is not supported");
-        std::process::exit(1);
-    }
-    let offset = zip_data.len() as u32;
+    let offset = require_u32(zip_data.len(), "archive");
     zip_data.extend_from_slice(&central_dir);
 
-    let eocd =
-        zip::EndOfCentralDirectory::new(entries.len() as u16, offset, central_dir.len() as u32);
+    let eocd = zip::EndOfCentralDirectory::new(
+        entries.len() as u16,
+        offset,
+        require_u32(central_dir.len(), "central directory"),
+    );
     zip_data.extend_from_slice(&eocd.to_bytes());
 
     reporter.finish();

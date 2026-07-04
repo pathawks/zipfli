@@ -127,6 +127,25 @@ pub struct CentralDirectoryHeader {
     pub external_attributes: u32,
 }
 
+impl Default for CentralDirectoryHeader {
+    fn default() -> Self {
+        Self {
+            version_made_by: 20,
+            version_to_extract: 20,
+            general_purpose_flag: 0,
+            compression_method: CompressionMethod::Deflate as u16,
+            last_mod_time: 0,
+            last_mod_date: 0,
+            crc32: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            file_name: String::new(),
+            local_header_offset: 0,
+            external_attributes: 0,
+        }
+    }
+}
+
 impl CentralDirectoryHeader {
     pub fn new(
         filename: &str,
@@ -150,12 +169,10 @@ impl CentralDirectoryHeader {
             compression_method,
             last_mod_time: dt.time,
             last_mod_date: dt.date,
-            version_made_by: 20,
-            version_to_extract: 20,
             general_purpose_flag: gp_flag(filename),
             crc32,
             local_header_offset,
-            external_attributes: 0,
+            ..Default::default()
         }
     }
 
@@ -164,17 +181,11 @@ impl CentralDirectoryHeader {
     pub fn directory(name: &str, local_header_offset: u32) -> Self {
         Self {
             file_name: name.to_string(),
-            uncompressed_size: 0,
-            compressed_size: 0,
-            compression_method: CompressionMethod::Store as u16,
-            last_mod_time: 0,
-            last_mod_date: 0,
-            version_made_by: 20,
-            version_to_extract: 20,
             general_purpose_flag: gp_flag(name),
-            crc32: 0,
+            compression_method: CompressionMethod::Store as u16,
             local_header_offset,
             external_attributes: DIR_EXTERNAL_ATTRS,
+            ..Default::default()
         }
     }
 
